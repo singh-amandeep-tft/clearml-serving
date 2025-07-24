@@ -15,6 +15,7 @@ from typing import Optional, Dict, Any, Callable, Union
 
 from clearml_serving.version import __version__
 from clearml_serving.serving.init import setup_task
+
 from clearml_serving.serving.model_request_processor import (
     ModelRequestProcessor,
     EndpointNotFoundException,
@@ -23,6 +24,7 @@ from clearml_serving.serving.model_request_processor import (
     ServingInitializationException,
 )
 from clearml_serving.serving.utils import parse_grpc_errors
+
 
 
 class GzipRequest(Request):
@@ -123,6 +125,7 @@ router = APIRouter(
 @router.post("/{model_id}/")
 @router.post("/{model_id}")
 async def serve_model(model_id: str, version: Optional[str] = None, request: Union[bytes, Dict[Any, Any]] = None):
+    processor.on_request_endpoint_telemetry(base_url=model_id, version=version)
     try:
         return_value = await processor.process_request(base_url=model_id, version=version, request_body=request)
     except EndpointNotFoundException as ex:
@@ -168,6 +171,7 @@ async def serve_model(model_id: str, version: Optional[str] = None, request: Uni
             )
         )
         raise HTTPException(status_code=500, detail="Error  [{}] processing request: {}".format(type(ex), ex))
+    processor.on_response_endpoint_telemetry(base_url=model_id, version=version)
     return return_value
 
 
