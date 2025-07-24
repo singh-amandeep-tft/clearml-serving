@@ -2,14 +2,10 @@ import os
 import shlex
 import traceback
 import gzip
-import asyncio
 
 from fastapi import FastAPI, Request, Response, APIRouter, HTTPException
 from fastapi.routing import APIRoute
-from fastapi.responses import PlainTextResponse
 from grpc.aio import AioRpcError
-
-from starlette.background import BackgroundTask
 
 from typing import Optional, Dict, Any, Callable, Union
 
@@ -24,7 +20,6 @@ from clearml_serving.serving.model_request_processor import (
     ServingInitializationException,
 )
 from clearml_serving.serving.utils import parse_grpc_errors
-
 
 
 class GzipRequest(Request):
@@ -67,11 +62,6 @@ grpc_aio_ignore_errors = parse_grpc_errors(shlex.split(os.environ.get("CLEARML_S
 grpc_aio_verbose_errors = parse_grpc_errors(shlex.split(os.environ.get("CLEARML_SERVING_AIO_RPC_VERBOSE_ERRORS", "")))
 
 
-class CUDAException(Exception):
-    def __init__(self, exception: str):
-        self.exception = exception
-
-
 # start FastAPI app
 app = FastAPI(title="ClearML Serving Service", version=__version__, description="ClearML Service Service router")
 
@@ -94,22 +84,6 @@ async def startup_event():
         )
         print("ModelRequestProcessor [id={}] loaded".format(processor.get_id()))
         processor.launch(poll_frequency_sec=model_sync_frequency_secs * 60)
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    print("RESTARTING INFERENCE SERVICE!")
-
-
-async def exit_app():
-    loop = asyncio.get_running_loop()
-    loop.stop()
-
-
-@app.exception_handler(CUDAException)
-async def cuda_exception_handler(request, exc):
-    task = BackgroundTask(exit_app)
-    return PlainTextResponse("CUDA out of memory. Restarting service", status_code=500, background=task)
 
 
 router = APIRouter(
@@ -151,7 +125,8 @@ async def serve_model(model_id: str, version: Optional[str] = None, request: Uni
             )
         )
         if "CUDA out of memory. " in str(ex) or "NVML_SUCCESS == r INTERNAL ASSERT FAILED" in str(ex):
-            raise CUDAException(exception=ex)
+            # can't always recover from this - prefer to exit the program such that it can be restarted
+            os._exit(1)
         else:
             raise HTTPException(status_code=422, detail="Error [{}] processing request: {}".format(type(ex), ex))
     except AioRpcError as ex:
