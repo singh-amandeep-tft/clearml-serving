@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import threading
 import traceback
@@ -14,6 +15,12 @@ from requests import post as request_post
 
 from .endpoints import ModelEndpoint
 
+class Singleton(object):
+    _instance = None
+    def __new__(class_, *args, **kwargs):
+        if not isinstance(class_._instance, class_):
+            class_._instance = object.__new__(class_, *args, **kwargs)
+        return class_._instance
 
 class BasePreprocessRequest(object):
     __preprocessing_lookup = {}
@@ -603,6 +610,738 @@ class CustomAsyncPreprocessRequest(BasePreprocessRequest):
         base_url = (base_url or BasePreprocessRequest._default_serving_base_url).strip("/")
         url = "{}/{}".format(base_url, endpoint.strip("/"))
         return_value = await CustomAsyncPreprocessRequest.asyncio_to_thread(
+            request_post, url, json=data, timeout=BasePreprocessRequest._timeout)
+        if not return_value.ok:
+            return None
+        return return_value.json()
+
+
+class VllmEngine(Singleton):
+    # is_already_loaded = False
+
+    def __init__(self) -> None:
+        from vllm.logger import init_logger
+        self.logger = init_logger('vllm.entrypoints.openai.api_server')
+
+        import socket
+        import prometheus_client
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if not s.connect_ex(('localhost', 8000)) == 0:
+                prometheus_client.start_http_server(8000)
+
+    def load_engine(
+        self,
+        name: str,
+        model_path: str,
+        vllm_model_config: dict,
+        chat_settings: dict
+    ) -> None:
+
+        from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.engine.async_llm_engine import AsyncLLMEngine
+        from vllm.entrypoints.logger import RequestLogger
+        from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+        from vllm.entrypoints.openai.serving_classification import ServingClassification
+        from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+        from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
+        from vllm.entrypoints.openai.serving_engine import OpenAIServing
+        from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+        from vllm.entrypoints.openai.serving_pooling import OpenAIServingPooling
+        from vllm.entrypoints.openai.serving_score import ServingScores
+        from vllm.entrypoints.openai.serving_tokenization import OpenAIServingTokenization
+        from vllm.entrypoints.openai.serving_transcription import (
+            OpenAIServingTranscription,
+            OpenAIServingTranslation
+        )
+        from vllm.entrypoints.chat_utils import (
+            load_chat_template,
+            resolve_hf_chat_template,
+            resolve_mistral_chat_template
+        )
+        from vllm.transformers_utils.tokenizer import MistralTokenizer
+        from vllm.usage.usage_lib import UsageContext
+        from vllm import envs
+
+        # if self.is_already_loaded:
+        #     self.add_models(name=name, model_path=model_path)
+        #     return None
+
+        vllm_engine_config = json.loads(os.environ.get("VLLM_ENGINE_ARGS").replace("'", ""))
+        vllm_engine_config["model"] = model_path
+        vllm_engine_config["served_model_name"] = name
+        engine_args = AsyncEngineArgs(**vllm_engine_config)
+        if envs.VLLM_USE_V1:
+            async_engine_client = AsyncLLM.from_engine_args(
+                engine_args,
+                usage_context=UsageContext.OPENAI_API_SERVER
+            )
+        else:
+            async_engine_client = AsyncLLMEngine.from_engine_args(
+                engine_args,
+                usage_context=UsageContext.OPENAI_API_SERVER
+            )
+        model_config = async_engine_client.engine.get_model_config()
+        request_logger = RequestLogger(
+            max_log_len=vllm_model_config["max_log_len"]
+        )
+        resolved_chat_template = load_chat_template(vllm_model_config["chat_template"])
+        if resolved_chat_template is not None:
+            # Get the tokenizer to check official template
+            tokenizer = async_engine_client.engine.get_tokenizer()
+
+            if isinstance(tokenizer, MistralTokenizer):
+                # The warning is logged in resolve_mistral_chat_template.
+                resolved_chat_template = resolve_mistral_chat_template(
+                    chat_template=resolved_chat_template)
+            else:
+                hf_chat_template = resolve_hf_chat_template(
+                    tokenizer=tokenizer,
+                    chat_template=None,
+                    tools=None,
+                    model_config=model_config,
+                )
+
+                if hf_chat_template != resolved_chat_template:
+                    self.logger.warning(
+                        "Using supplied chat template: %s\n"
+                        "It is different from official chat template '%s'. "
+                        "This discrepancy may lead to performance degradation.",
+                        resolved_chat_template, model_path)
+        self.openai_serving_models = OpenAIServingModels(
+            async_engine_client,
+            model_config,
+            [BaseModelPath(name=name, model_path=model_path)],
+            lora_modules=vllm_model_config["lora_modules"],
+            prompt_adapters=vllm_model_config["prompt_adapters"],
+        )
+
+        import asyncio
+        asyncio.create_task(self.openai_serving_models.init_static_loras())
+
+        self.openai_serving = OpenAIServing(
+            async_engine_client,
+            model_config,
+            self.openai_serving_models,
+            request_logger=request_logger,
+            return_tokens_as_token_ids=vllm_model_config["return_tokens_as_token_ids"],
+            enable_force_include_usage=chat_settings["enable_force_include_usage"]
+        )
+        self.openai_serving_chat = OpenAIServingChat(
+            async_engine_client,
+            model_config,
+            self.openai_serving_models,
+            response_role=vllm_model_config["response_role"],
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=chat_settings["chat_template_content_format"],
+            return_tokens_as_token_ids=vllm_model_config["return_tokens_as_token_ids"],
+            reasoning_parser=chat_settings["reasoning_parser"],
+            enable_auto_tools=chat_settings["enable_auto_tools"],
+            expand_tools_even_if_tool_choice_none=chat_settings["expand_tools_even_if_tool_choice_none"],
+            tool_parser=chat_settings["tool_parser"],
+            enable_prompt_tokens_details=chat_settings["enable_prompt_tokens_details"],
+            enable_force_include_usage=chat_settings["enable_force_include_usage"]
+        ) if model_config.runner_type == "generate" else None
+        self.openai_serving_completion = OpenAIServingCompletion(
+            async_engine_client,
+            model_config,
+            self.openai_serving_models,
+            request_logger=request_logger,
+            return_tokens_as_token_ids=vllm_model_config["return_tokens_as_token_ids"],
+            enable_force_include_usage=chat_settings["enable_force_include_usage"]
+        ) if model_config.runner_type == "generate" else None
+        self.openai_serving_pooling = OpenAIServingPooling(
+            async_engine_client,
+            model_config,
+            self.openai_serving_models,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=chat_settings["chat_template_content_format"]
+        ) if model_config.runner_type == "pooling" else None
+        self.openai_serving_embedding = OpenAIServingEmbedding(
+            async_engine_client,
+            model_config,
+            self.openai_serving_models,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=chat_settings["chat_template_content_format"]
+        ) if model_config.task == "embed" else None
+        self.openai_serving_classification = ServingClassification(
+            async_engine_client,
+            model_config,
+            self.openai_serving_models,
+            request_logger=request_logger
+        ) if model_config.task == "classify" else None
+        enable_serving_reranking = (model_config.task == "classify" and getattr(model_config.hf_config, "num_labels", 0) == 1)
+        # self.jinaai_serving_reranking = ServingScores(
+        #     async_engine_client,
+        #     model_config,
+        #     self.openai_serving_models,
+        #     request_logger=request_logger
+        # ) if enable_serving_reranking else None
+        self.openai_serving_scores = ServingScores(
+            async_engine_client,
+            model_config,
+            self.openai_serving_models,
+            request_logger=request_logger
+        ) if (model_config.task == "embed" or enable_serving_reranking) else None
+        self.openai_serving_tokenization = OpenAIServingTokenization(
+            async_engine_client,
+            model_config,
+            self.openai_serving_models,
+            request_logger=request_logger,
+            chat_template=vllm_model_config["chat_template"],
+            chat_template_content_format=chat_settings["chat_template_content_format"]
+        )
+        self.openai_serving_transcription = OpenAIServingTranscription(
+            async_engine_client,
+            model_config,
+            self.openai_serving_models,
+            request_logger=request_logger
+        ) if model_config.runner_type == "transcription" else None
+        self.openai_serving_translation = OpenAIServingTranslation(
+            async_engine_client,
+            model_config,
+            self.openai_serving_models,
+            request_logger=request_logger,
+        ) if model_config.runner_type == "transcription" else None
+        self.task = model_config.task
+        self.enable_server_load_tracking = False
+        # state.server_load_metrics = 0
+        self.logger.info("vLLM Engine was successfully initialized")
+        # self.is_already_loaded = True
+        return None
+
+    def add_models(self, name: str, model_path: str) -> None:
+        from vllm.entrypoints.openai.serving_models import BaseModelPath
+        self.openai_serving_models.base_model_paths.append(
+            BaseModelPath(
+                name=name, model_path=model_path
+            )
+        )
+        self.logger.info("Model {} was added to vllm engine".format(name))
+        # TODO: RESTART ENGINE
+        return None
+    
+    def remove_model(self, name: str) -> None:
+        self.openai_serving_models.base_model_paths = [
+            model for model in self.openai_serving_models.base_model_paths
+            if model.name != name
+        ]
+        self.logger.info("Model {} was removed from vllm engine".format(name))
+        # TODO: RESTART ENGINE
+        return None
+
+    async def tokenize(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, TokenizeResponse
+        from fastapi.responses import JSONResponse
+        from typing_extensions import assert_never
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_tokenization
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Tokenization API"
+            )
+        generator = await handler.create_tokenize(request=request, raw_request=raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, TokenizeResponse):
+            return JSONResponse(content=generator.model_dump())
+        assert_never(generator)
+
+    async def detokenize(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, DetokenizeResponse
+        from fastapi.responses import JSONResponse
+        from typing_extensions import assert_never
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_tokenization
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Detokenization API"
+            )
+        generator = await handler.create_detokenize(request=request, raw_request=raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, DetokenizeResponse):
+            return JSONResponse(content=generator.model_dump())
+        assert_never(generator)
+
+    async def models(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from fastapi.responses import JSONResponse
+        models_ = await self.openai_serving_models.show_available_models()
+        return JSONResponse(content=models_.model_dump())
+
+    async def show_version(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.version import __version__ as VLLM_VERSION
+        from fastapi.responses import JSONResponse
+        ver = {"version": VLLM_VERSION}
+        return JSONResponse(content=ver)
+
+    async def completions(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, CompletionResponse
+        from fastapi.responses import JSONResponse, StreamingResponse
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_completion
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Completions API"
+            )
+        generator = await handler.create_completion(request=request, raw_request=raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, CompletionResponse):
+            return JSONResponse(content=generator.model_dump())
+        return StreamingResponse(content=generator, media_type="text/event-stream")
+
+    async def chat_completions(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, ChatCompletionResponse
+        from fastapi.responses import JSONResponse, StreamingResponse
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_chat
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Chat Completions API"
+            )
+        generator = await handler.create_chat_completion(request=request, raw_request=raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, ChatCompletionResponse):
+            return JSONResponse(content=generator.model_dump())
+        return StreamingResponse(content=generator, media_type="text/event-stream")
+
+    async def embedding(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, EmbeddingResponse
+        from fastapi.responses import JSONResponse
+        from typing_extensions import assert_never
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_embedding
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Embeddings API"
+            )
+        generator = await handler.create_embedding(request=request, raw_request=raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, EmbeddingResponse):
+            return JSONResponse(content=generator.model_dump())
+        assert_never(generator)
+
+    async def pooling(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, PoolingResponse
+        from fastapi.responses import JSONResponse
+        from typing_extensions import assert_never
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_pooling
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Pooling API"
+            )
+        generator = await handler.create_pooling(request=request, raw_request=raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, PoolingResponse):
+            return JSONResponse(content=generator.model_dump())
+        assert_never(generator)
+
+    async def classify(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, ClassificationResponse
+        from fastapi.responses import JSONResponse
+        from typing_extensions import assert_never
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_classification
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Classification API"
+            )
+        generator = await handler.create_classify(request=request, raw_request=raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, ClassificationResponse):
+            return JSONResponse(content=generator.model_dump())
+        assert_never(generator)
+
+    async def score(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, ScoreResponse
+        from fastapi.responses import JSONResponse
+        from typing_extensions import assert_never
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_scores
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Score API"
+            )
+        generator = await handler.create_score(request=request, raw_request=raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, ScoreResponse):
+            return JSONResponse(content=generator.model_dump())
+        assert_never(generator)
+
+    async def audio_transcriptions(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, TranscriptionResponse
+        from fastapi.responses import JSONResponse, StreamingResponse
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_transcription
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Transcriptions API"
+            )
+        audio_data = await request.file.read()
+        generator = await handler.create_transcription(audio_data, request, raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, TranscriptionResponse):
+            return JSONResponse(content=generator.model_dump())
+        return StreamingResponse(content=generator, media_type="text/event-stream")
+
+    async def audio_translations(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, TranslationResponse
+        from fastapi.responses import JSONResponse, StreamingResponse
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_translation
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Translations API"
+            )
+        audio_data = await request.file.read()
+        generator = await handler.create_translation(audio_data, request, raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, TranslationResponse):
+            return JSONResponse(content=generator.model_dump())
+        return StreamingResponse(content=generator, media_type="text/event-stream")
+
+    async def rerank(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        from vllm.entrypoints.openai.protocol import ErrorResponse, RerankResponse
+        from fastapi.responses import JSONResponse
+        from typing_extensions import assert_never
+        request, raw_request = data["request"], data["raw_request"]
+        handler = self.openai_serving_scores
+        if handler is None:
+            return self.openai_serving.create_error_response(
+                message="The model does not support Rerank (Score) API"
+            )
+        generator = await handler.do_rerank(request=request, raw_request=raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        elif isinstance(generator, RerankResponse):
+            return JSONResponse(content=generator.model_dump())
+        assert_never(generator)
+
+@BasePreprocessRequest.register_engine("vllm", modules=["vllm", "fastapi"])
+class VllmPreprocessRequest(BasePreprocessRequest):
+    is_preprocess_async = True
+    is_process_async = True
+    is_postprocess_async = True
+    asyncio_to_thread = None
+    _vllm_engine = None
+
+    def __init__(self, model_endpoint: ModelEndpoint, task: Task = None):
+        super(VllmPreprocessRequest, self).__init__(
+            model_endpoint=model_endpoint, task=task)
+        self._vllm_engine = VllmEngine()
+        self._vllm_engine.load_engine(
+            name=model_endpoint.serving_url,
+            model_path=self._get_local_model_file(),
+            **self._model
+        )
+
+        if VllmPreprocessRequest.asyncio_to_thread is None:
+            from asyncio import to_thread as asyncio_to_thread
+            VllmPreprocessRequest.asyncio_to_thread = asyncio_to_thread
+
+        # override `send_request` method with the async version
+        self._preprocess.__class__.send_request = VllmPreprocessRequest._preprocess_send_request
+
+    async def preprocess(
+            self,
+            request: dict,
+            state: dict,
+            collect_custom_statistics_fn: Callable[[dict], None] = None,
+    ) -> Optional[Any]:
+        """
+        Raise exception to report an error
+        Return value will be passed to serving engine
+
+        :param request: dictionary as recieved from the RestAPI
+        :param state: Use state dict to store data passed to the post-processing function call.
+            Usage example:
+            >>> def preprocess(..., state):
+                    state['preprocess_aux_data'] = [1,2,3]
+            >>> def postprocess(..., state):
+                    print(state['preprocess_aux_data'])
+        :param collect_custom_statistics_fn: Optional, allows to send a custom set of key/values
+            to the statictics collector servicd
+
+            Usage example:
+            >>> print(request)
+            {"x0": 1, "x1": 2}
+            >>> collect_custom_statistics_fn({"x0": 1, "x1": 2})
+
+        :return: Object to be passed directly to the model inference
+        """
+        if self._preprocess is not None and hasattr(self._preprocess, 'preprocess'):
+            return await self._preprocess.preprocess(request, state, collect_custom_statistics_fn)
+        return request
+
+    async def postprocess(
+            self,
+            data: Any,
+            state: dict,
+            collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Optional[dict]:
+        """
+        Raise exception to report an error
+        Return value will be passed to serving engine
+
+        :param data: object as recieved from the inference model function
+        :param state: Use state dict to store data passed to the post-processing function call.
+            Usage example:
+            >>> def preprocess(..., state):
+                    state['preprocess_aux_data'] = [1,2,3]
+            >>> def postprocess(..., state):
+                    print(state['preprocess_aux_data'])
+        :param collect_custom_statistics_fn: Optional, allows to send a custom set of key/values
+            to the statictics collector servicd
+
+            Usage example:
+            >>> collect_custom_statistics_fn({"y": 1})
+
+        :return: Dictionary passed directly as the returned result of the RestAPI
+        """
+        if self._preprocess is not None and hasattr(self._preprocess, 'postprocess'):
+            return await self._preprocess.postprocess(data, state, collect_custom_statistics_fn)
+        return data
+
+    async def tokenize(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.tokenize(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def detokenize(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.detokenize(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def v1_models(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.models(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def version(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.show_version(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def v1_chat_completions(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.chat_completions(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def v1_completions(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.completions(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def v1_embeddings(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.embedding(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def pooling(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.pooling(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+    
+    async def classify(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.classify(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def score(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.score(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def v1_audio_transcriptions(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.audio_transcriptions(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def v1_audio_translations(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.audio_translations(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    async def rerank(
+        self,
+        data: Any,
+        state: dict,
+        collect_custom_statistics_fn: Callable[[dict], None] = None
+    ) -> Any:
+        return await self._vllm_engine.rerank(
+            data=data,
+            state=state,
+            collect_custom_statistics_fn=collect_custom_statistics_fn
+        )
+
+    @staticmethod
+    async def _preprocess_send_request(_, endpoint: str, version: str = None, data: dict = None) -> Optional[dict]:
+        endpoint = "/openai/{}".format(endpoint.strip("/"))
+        base_url = BasePreprocessRequest.get_server_config().get("base_serving_url")
+        base_url = (base_url or BasePreprocessRequest._default_serving_base_url).strip("/")
+        url = "{}/{}".format(base_url, endpoint.strip("/"))
+        return_value = await VllmPreprocessRequest.asyncio_to_thread(
             request_post, url, json=data, timeout=BasePreprocessRequest._timeout)
         if not return_value.ok:
             return None

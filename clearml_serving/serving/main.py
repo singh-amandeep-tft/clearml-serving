@@ -2,16 +2,23 @@ import os
 import shlex
 import traceback
 import gzip
+import asyncio
 
-from fastapi import FastAPI, Request, Response, APIRouter, HTTPException
+from fastapi import FastAPI, Request, Response, APIRouter, HTTPException, Depends
 from fastapi.routing import APIRoute
+from fastapi.responses import PlainTextResponse
 from grpc.aio import AioRpcError
+
+from http import HTTPStatus
+
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest, CompletionRequest
+
+from starlette.background import BackgroundTask
 
 from typing import Optional, Dict, Any, Callable, Union
 
 from clearml_serving.version import __version__
 from clearml_serving.serving.init import setup_task
-
 from clearml_serving.serving.model_request_processor import (
     ModelRequestProcessor,
     EndpointNotFoundException,
@@ -62,6 +69,11 @@ grpc_aio_ignore_errors = parse_grpc_errors(shlex.split(os.environ.get("CLEARML_S
 grpc_aio_verbose_errors = parse_grpc_errors(shlex.split(os.environ.get("CLEARML_SERVING_AIO_RPC_VERBOSE_ERRORS", "")))
 
 
+class CUDAException(Exception):
+    def __init__(self, exception: str):
+        self.exception = exception
+
+
 # start FastAPI app
 app = FastAPI(title="ClearML Serving Service", version=__version__, description="ClearML Service Service router")
 
@@ -86,22 +98,44 @@ async def startup_event():
         processor.launch(poll_frequency_sec=model_sync_frequency_secs * 60)
 
 
-router = APIRouter(
-    prefix="/serve",
-    tags=["models"],
-    responses={404: {"description": "Model Serving Endpoint Not found"}},
-    route_class=GzipRoute,  # mark-out to remove support for GZip content encoding
-)
+@app.on_event("shutdown")
+def shutdown_event():
+    print("RESTARTING INFERENCE SERVICE!")
 
 
-# cover all routing options for model version `/{model_id}`, `/{model_id}/123`, `/{model_id}?version=123`
-@router.post("/{model_id}/{version}")
-@router.post("/{model_id}/")
-@router.post("/{model_id}")
-async def serve_model(model_id: str, version: Optional[str] = None, request: Union[bytes, Dict[Any, Any]] = None):
-    processor.on_request_endpoint_telemetry(base_url=model_id, version=version)
+async def exit_app():
+    loop = asyncio.get_running_loop()
+    loop.stop()
+
+
+@app.exception_handler(CUDAException)
+async def cuda_exception_handler(request, exc):
+    task = BackgroundTask(exit_app)
+    return PlainTextResponse("CUDA out of memory. Restarting service", status_code=500, background=task)
+
+def check_cuda_oom_exception(ex: Exception):
+    if "CUDA out of memory. " in str(ex) or "NVML_SUCCESS == r INTERNAL ASSERT FAILED" in str(ex):
+        if os.environ.get("CLEARML_SERVING_DEV_CUDAEXCEPTION", "0") != "0":
+            raise CUDAException(exception=ex)
+        # can't always recover from this - prefer to exit the program such that it can be restarted
+        os._exit(1)
+    else:
+        raise HTTPException(status_code=422, detail="Error [{}] processing request: {}".format(type(ex), ex))
+
+async def process_with_exceptions(
+    base_url: str,
+    version: Optional[str],
+    request: Union[bytes, Dict[Any, Any]],
+    serve_type: str
+):
+    processor.on_request_endpoint_telemetry(base_url=base_url, version=version)
     try:
-        return_value = await processor.process_request(base_url=model_id, version=version, request_body=request)
+        return_value = await processor.process_request(
+            base_url=base_url,
+            version=version,
+            request_body=request,
+            serve_type=serve_type
+        )
     except EndpointNotFoundException as ex:
         raise HTTPException(status_code=404, detail="Error processing request, endpoint was not found: {}".format(ex))
     except (EndpointModelLoadException, EndpointBackendEngineException) as ex:
@@ -124,11 +158,7 @@ async def serve_model(model_id: str, version: Optional[str] = None, request: Uni
                 instance_id, type(ex), ex, request, "".join(traceback.format_exc())
             )
         )
-        if "CUDA out of memory. " in str(ex) or "NVML_SUCCESS == r INTERNAL ASSERT FAILED" in str(ex):
-            # can't always recover from this - prefer to exit the program such that it can be restarted
-            os._exit(1)
-        else:
-            raise HTTPException(status_code=422, detail="Error [{}] processing request: {}".format(type(ex), ex))
+        check_cuda_oom_exception(ex)
     except AioRpcError as ex:
         if grpc_aio_verbose_errors and ex.code() in grpc_aio_verbose_errors:
             session_logger.report_text(
@@ -145,9 +175,59 @@ async def serve_model(model_id: str, version: Optional[str] = None, request: Uni
                 instance_id, type(ex), ex, request, "".join(traceback.format_exc())
             )
         )
-        raise HTTPException(status_code=500, detail="Error  [{}] processing request: {}".format(type(ex), ex))
-    processor.on_response_endpoint_telemetry(base_url=model_id, version=version)
+        check_cuda_oom_exception(ex)
+    processor.on_response_endpoint_telemetry(base_url=base_url, version=version)
     return return_value
 
+
+router = APIRouter(
+    prefix=f"/{os.environ.get("CLEARML_DEFAULT_SERVE_SUFFIX", "serve")}",
+    tags=["models"],
+    responses={404: {"description": "Model Serving Endpoint Not found"}},
+    route_class=GzipRoute,  # mark-out to remove support for GZip content encoding
+)
+
+
+@router.post("/{model_id}/{version}")
+@router.post("/{model_id}/")
+@router.post("/{model_id}")
+async def base_serve_model(
+    model_id: str,
+    version: Optional[str] = None,
+    request: Union[bytes, Dict[Any, Any]] = None
+):
+    return_value = await process_with_exceptions(
+        base_url=model_id,
+        version=version,
+        request=request,
+        serve_type="process"
+    )
+    return return_value
+
+
+async def validate_json_request(raw_request: Request):
+    content_type = raw_request.headers.get("content-type", "").lower()
+    media_type = content_type.split(";", maxsplit=1)[0]
+    if media_type != "application/json":
+        raise HTTPException(
+            status_code=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            detail="Unsupported Media Type: Only 'application/json' is allowed"
+        )
+
+@router.post("/openai/{endpoint_type:path}", dependencies=[Depends(validate_json_request)])
+@router.get("/openai/{endpoint_type:path}", dependencies=[Depends(validate_json_request)])
+async def openai_serve_model(
+    endpoint_type: str,
+    request: Union[CompletionRequest, ChatCompletionRequest],
+    raw_request: Request
+):
+    combined_request = {"request": request, "raw_request": raw_request}
+    return_value = await process_with_exceptions(
+        base_url=request.model,
+        version=None,
+        request=combined_request,
+        serve_type=endpoint_type
+    )
+    return return_value
 
 app.include_router(router)

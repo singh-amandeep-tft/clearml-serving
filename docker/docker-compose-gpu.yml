@@ -96,7 +96,7 @@ services:
       CLEARML_DEFAULT_SERVE_SUFFIX: ${CLEARML_DEFAULT_SERVE_SUFFIX:-serve}
       CLEARML_DEFAULT_BASE_SERVE_URL: ${CLEARML_DEFAULT_BASE_SERVE_URL:-http://127.0.0.1:8080/serve}
       CLEARML_DEFAULT_KAFKA_SERVE_URL: ${CLEARML_DEFAULT_KAFKA_SERVE_URL:-clearml-serving-kafka:9092}
-      CLEARML_DEFAULT_TRITON_GRPC_ADDR: ${CLEARML_DEFAULT_TRITON_GRPC_ADDR:-clearml-serving-triton:8001}
+      CLEARML_DEFAULT_TRITON_GRPC_ADDR: ${CLEARML_DEFAULT_TRITON_GRPC_ADDR:-}
       CLEARML_USE_GUNICORN: ${CLEARML_USE_GUNICORN:-}
       CLEARML_SERVING_RESTART_ON_FAILURE: ${CLEARML_SERVING_RESTART_ON_FAILURE:-}
       CLEARML_SERVING_NUM_PROCESS: ${CLEARML_SERVING_NUM_PROCESS:-}
@@ -109,37 +109,7 @@ services:
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
       AZURE_STORAGE_ACCOUNT: ${AZURE_STORAGE_ACCOUNT:-}
       AZURE_STORAGE_KEY: ${AZURE_STORAGE_KEY:-}
-    depends_on:
-      - kafka
-      - clearml-serving-triton
-    networks:
-      - clearml-serving-backend
-
-  clearml-serving-triton:
-    image: allegroai/clearml-serving-triton:latest
-    container_name: clearml-serving-triton
-    restart: unless-stopped
-    # optimize perforamnce
-    security_opt:
-      - seccomp:unconfined
-    # ports:
-      # - "8001:8001"
-    environment:
-      CLEARML_WEB_HOST: ${CLEARML_WEB_HOST:-https://app.clear.ml}
-      CLEARML_API_HOST: ${CLEARML_API_HOST:-https://api.clear.ml}
-      CLEARML_FILES_HOST: ${CLEARML_FILES_HOST:-https://files.clear.ml}
-      CLEARML_API_ACCESS_KEY: ${CLEARML_API_ACCESS_KEY}
-      CLEARML_API_SECRET_KEY: ${CLEARML_API_SECRET_KEY}
-      CLEARML_SERVING_TASK_ID: ${CLEARML_SERVING_TASK_ID:-}
-      CLEARML_TRITON_POLL_FREQ: ${CLEARML_TRITON_POLL_FREQ:-1.0}
-      CLEARML_TRITON_METRIC_FREQ: ${CLEARML_TRITON_METRIC_FREQ:-1.0}
-      CLEARML_EXTRA_PYTHON_PACKAGES: ${CLEARML_EXTRA_PYTHON_PACKAGES:-}      
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
-      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
-      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
-      AZURE_STORAGE_ACCOUNT: ${AZURE_STORAGE_ACCOUNT:-}
-      AZURE_STORAGE_KEY: ${AZURE_STORAGE_KEY:-}
+      VLLM_ENGINE_ARGS: ${VLLM_ENGINE_ARGS:-'{"disable_log_requests":true,"disable_log_stats":false,"gpu_memory_utilization":0.95,"enforce_eager":true}'}
     depends_on:
       - kafka
     networks:
@@ -148,7 +118,9 @@ services:
       resources:
         reservations:
           devices:
-            - capabilities: [gpu]
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
 
   clearml-serving-statistics:
     image: allegroai/clearml-serving-statistics:latest

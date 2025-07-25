@@ -250,7 +250,7 @@ class ModelRequestProcessor(object):
         except Exception as e:
             print("Error: Could not stop endpoint telemetry '{}'".format(e))
 
-    async def process_request(self, base_url: str, version: str, request_body: dict) -> dict:
+    async def process_request(self, base_url: str, version: str, request_body: dict, serve_type: str) -> dict:
         """
         Process request coming in,
         Raise Value error if url does not match existing endpoints
@@ -262,7 +262,12 @@ class ModelRequestProcessor(object):
             while self._update_lock_flag:
                 await asyncio.sleep(0.5+random())
             # retry to process
-            return await self.process_request(base_url=base_url, version=version, request_body=request_body)
+            return await self.process_request(
+                base_url=base_url,
+                version=version,
+                request_body=request_body,
+                serve_type=serve_type
+            )
 
         processor = None
         url = None
@@ -285,7 +290,12 @@ class ModelRequestProcessor(object):
                 processor = processor_cls(model_endpoint=ep, task=self._task)
                 self._engine_processor_lookup[url] = processor
 
-            return_value = await self._process_request(processor=processor, url=url, body=request_body)
+            return_value = await self._process_request(
+                processor=processor,
+                url=url,
+                body=request_body,
+                serve_type=serve_type
+            )
         finally:
             if url and processor is not None and processor is not self._engine_processor_lookup.get(url):
                 gc.collect()
@@ -1296,7 +1306,7 @@ class ModelRequestProcessor(object):
         # update preprocessing classes
         BasePreprocessRequest.set_server_config(self._configuration)
 
-    async def _process_request(self, processor: BasePreprocessRequest, url: str, body: dict) -> dict:
+    async def _process_request(self, processor: BasePreprocessRequest, url: str, body: dict, serve_type: str) -> dict:
         # collect statistics for this request
         stats_collect_fn = None
         collect_stats = False
@@ -1318,10 +1328,11 @@ class ModelRequestProcessor(object):
         preprocessed = await processor.preprocess(body, state, stats_collect_fn) \
             if processor.is_preprocess_async \
             else processor.preprocess(body, state, stats_collect_fn)
+        processed_func = getattr(processor, serve_type.replace("/", "_"))
         # noinspection PyUnresolvedReferences
-        processed = await processor.process(preprocessed, state, stats_collect_fn) \
+        processed = await processed_func(preprocessed, state, stats_collect_fn) \
             if processor.is_process_async \
-            else processor.process(preprocessed, state, stats_collect_fn)
+            else processed_func(preprocessed, state, stats_collect_fn)
         # noinspection PyUnresolvedReferences
         return_value = await processor.postprocess(processed, state, stats_collect_fn) \
             if processor.is_postprocess_async \
