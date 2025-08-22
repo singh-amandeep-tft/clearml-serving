@@ -97,6 +97,10 @@ async def startup_event():
         print("ModelRequestProcessor [id={}] loaded".format(processor.get_id()))
         processor.launch(poll_frequency_sec=model_sync_frequency_secs * 60)
 
+@app.on_event("startup")
+async def start_kafka():
+    from clearml_serving.serving.kafka_runner import start_kafka_loop
+    asyncio.create_task(start_kafka_loop())
 
 @app.on_event("shutdown")
 def shutdown_event():
@@ -181,7 +185,7 @@ async def process_with_exceptions(
 
 
 router = APIRouter(
-    prefix=f"/{os.environ.get("CLEARML_DEFAULT_SERVE_SUFFIX", "serve")}",
+    prefix=f'/{os.environ.get("CLEARML_DEFAULT_SERVE_SUFFIX", "serve")}',
     tags=["models"],
     responses={404: {"description": "Model Serving Endpoint Not found"}},
     route_class=GzipRoute,  # mark-out to remove support for GZip content encoding
